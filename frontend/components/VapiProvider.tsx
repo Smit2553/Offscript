@@ -38,6 +38,12 @@ interface VapiContextType {
     language: string,
     problemTitle: string,
   ) => void;
+  sendProblemContext: (problemData: {
+    title: string;
+    difficulty?: string;
+    description: string;
+    example_test_case?: Record<string, unknown>;
+  }) => void;
   error: string | null;
   transcript: TranscriptSegment[];
 }
@@ -165,21 +171,32 @@ export function VapiProvider({ children }: { children: ReactNode }) {
 
     // Listen for message events to capture transcript
     vapiInstance.on("message", (message: VapiMessage) => {
-      if (message.type === "transcript" && message.transcriptType === "final") {
-        const now = Date.now();
-        const secondsSinceStart = callStartTimeRef.current
-          ? (now - callStartTimeRef.current) / 1000
-          : 0;
+      try {
+        // Log all message types for debugging
+        if (message.type !== "transcript") {
+          console.log("📨 Vapi message:", message.type);
+        }
+        
+        // Only process transcript messages, ignore function calls and other types
+        if (message.type === "transcript" && message.transcriptType === "final") {
+          const now = Date.now();
+          const secondsSinceStart = callStartTimeRef.current
+            ? (now - callStartTimeRef.current) / 1000
+            : 0;
 
-        const segment: TranscriptSegment = {
-          type: "transcript",
-          role: message.role === "user" ? "user" : "assistant",
-          text: message.transcript,
-          timestamp: new Date(now).toISOString(),
-          secondsSinceStart,
-        };
+          const segment: TranscriptSegment = {
+            type: "transcript",
+            role: message.role === "user" ? "user" : "assistant",
+            text: message.transcript || "",
+            timestamp: new Date(now).toISOString(),
+            secondsSinceStart,
+          };
 
-        setTranscript((prev) => [...prev, segment]);
+          setTranscript((prev) => [...prev, segment]);
+        }
+      } catch (error) {
+        console.error("Error handling message:", error);
+        // Don't crash the call, just log the error
       }
     });
 
@@ -206,7 +223,29 @@ export function VapiProvider({ children }: { children: ReactNode }) {
         setError(null);
         // Store metadata for later use when uploading transcript
         callMetadataRef.current = metadata;
-        await vapi.start(assistantId);
+        
+        // Create assistant overrides to inject problem context via variableValues
+        const assistantOverrides: Record<string, unknown> = {};
+        
+        // If we have problem data, pass it as variables to the dashboard system prompt
+        if (metadata && metadata.problemTitle) {
+          assistantOverrides.variableValues = {
+            problemTitle: metadata.problemTitle || '',
+            problemDifficulty: metadata.problemDifficulty || 'Unknown',
+            problemDescription: metadata.problemDescription || '',
+            exampleInput: metadata.exampleInput || '',
+            exampleOutput: metadata.exampleOutput || '',
+            exampleExplanation: metadata.exampleExplanation || '',
+          };
+          
+          console.log("📋 Passing problem variables to Oscar:");
+          console.log(`   Title: ${metadata.problemTitle}`);
+          console.log(`   Difficulty: ${metadata.problemDifficulty}`);
+          console.log(`   Has example: ${metadata.exampleInput ? 'Yes' : 'No'}`);
+        }
+        
+        // Start call with variable overrides
+        await vapi.start(assistantId, assistantOverrides);
       } catch (err) {
         const errorMessage =
           err instanceof Error ? err.message : "Failed to start call";
@@ -245,36 +284,90 @@ export function VapiProvider({ children }: { children: ReactNode }) {
 
       try {
         const sessionId = getSessionId(); // Get unique session ID for this browser tab
+        const lines = code.split("\n").length;
       
-      console.log("📤 Sending code context via metadata");
+        console.log("📤 Sending code context to Oscar");
         console.log(`   Session: ${sessionId}`);
-      console.log(`   Problem: ${problem}`);
+        console.log(`   Problem: ${problem}`);
         console.log(`   Language: ${language}`);
-        console.log(`   Code length: ${code.length} chars`);
+        console.log(`   Code length: ${code.length} chars, ${lines} lines`);
 
-        // Use metadata approach - keeps code completely separate from conversation
-        // TypeScript doesn't recognize metadata field, so we cast to any
+        // Send code as system message content (not metadata)
+        // This ensures Oscar can actually see and reference the code
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (vapi as any).send({
           type: "add-message",
           message: {
             role: "system",
-            content: "Code context updated",
-          },
-          metadata: {
-          sessionId: sessionId,
-            type: "code_update",
-            problem: problem,
-            language: language,
-            code: code,
-            lines: code.split("\n").length,
-            timestamp: new Date().toISOString(),
+            content: `[LIVE CODE UPDATE - "${problem}"]
+
+The candidate's CURRENT code on screen (${language}, ${lines} lines):
+
+\`\`\`${language}
+${code}
+\`\`\`
+
+IMPORTANT: When asked "what am I doing?" or "what's my approach?", reference the EXACT code above. Read the actual lines of code carefully before responding. Do not make assumptions - describe what you actually see in the code block.`,
           },
         });
 
-        console.log("✅ Code context sent via metadata");
+        console.log("✅ Code sent to Oscar as system message");
       } catch (error) {
         console.error("❌ Failed to send code context:", error);
+      }
+    },
+    [vapi, isCallActive],
+  );
+
+  /**
+   * Send problem context to Oscar so he knows what question to discuss
+   * This is sent as a system message (visible to assistant) on call start
+   */
+  const sendProblemContext = useCallback(
+    (problemData: {
+      title: string;
+      difficulty?: string;
+      description: string;
+      example_test_case?: Record<string, unknown>;
+    }) => {
+      if (!vapi || !isCallActive) {
+        console.log("⚠️  Cannot send problem: Call not active");
+        return;
+      }
+
+      try {
+        console.log("📋 Sending problem context to Oscar");
+        console.log(`   Problem: ${problemData.title}`);
+        console.log(`   Difficulty: ${problemData.difficulty || 'Unknown'}`);
+
+        // Format example test case for readability
+        let exampleText = "";
+        if (problemData.example_test_case) {
+          const example = problemData.example_test_case;
+          exampleText = `\n\nExample:\nInput: ${example.input || 'N/A'}\nOutput: ${example.output || 'N/A'}${example.explanation ? `\nExplanation: ${example.explanation}` : ''}`;
+        }
+
+        // Send as system message so Oscar can reference it
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (vapi as any).send({
+          type: "add-message",
+          message: {
+            role: "system",
+            content: `INTERVIEW PROBLEM LOADED:
+
+Title: ${problemData.title}
+Difficulty: ${problemData.difficulty || 'Not specified'}
+
+Description:
+${problemData.description}${exampleText}
+
+The candidate is now working on this problem. You can reference it naturally in conversation when they ask you about it.`,
+          },
+        });
+
+        console.log("✅ Problem context sent to Oscar");
+      } catch (error) {
+        console.error("❌ Failed to send problem context:", error);
       }
     },
     [vapi, isCallActive],
@@ -289,6 +382,7 @@ export function VapiProvider({ children }: { children: ReactNode }) {
         startCall,
         endCall,
         sendCodeContext,
+        sendProblemContext,
         error,
         transcript,
       }}

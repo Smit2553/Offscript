@@ -91,6 +91,7 @@ function InterviewContent() {
     isCallActive,
     isSpeaking,
     sendCodeContext,
+    sendProblemContext,
     transcript,
     error: vapiError,
   } = useVapi();
@@ -224,6 +225,22 @@ function InterviewContent() {
     fetchProblem();
   }, [isMobile, problemId, API_URL]);
 
+  // Effect: Send problem context to Oscar when call starts
+  useEffect(() => {
+    if (isCallActive && problemData) {
+      // Wait 500ms for call to establish, then send problem context
+      setTimeout(() => {
+        console.log("📋 Sending problem context to Oscar");
+        sendProblemContext({
+          title: problemData.title,
+          difficulty: problemData.difficulty,
+          description: problemData.description,
+          example_test_case: problemData.example_test_case || problemData.details?.examples?.[0],
+        });
+      }, 500);
+    }
+  }, [isCallActive, problemData, sendProblemContext]);
+
   // Effect: Send initial starter code when call starts
   useEffect(() => {
     if (isCallActive && problemData && !hasInitialCodeBeenSent.current) {
@@ -269,11 +286,25 @@ function InterviewContent() {
 
       try {
         callInitializedRef.current = true;
-        await startCall({
-          problemTitle: problemData?.title,
-          problemType: problemData?.type,
+        
+        // Format problem data for Vapi
+        const problemMetadata = {
+          problemTitle: problemData.title,
+          problemType: problemData.type,
+          problemDifficulty: problemData.difficulty || 'Unknown',
+          problemDescription: problemData.description,
           language: language,
-        });
+          // Include example if available
+          ...(problemData.example_test_case && {
+            exampleInput: problemData.example_test_case.input,
+            exampleOutput: problemData.example_test_case.output,
+            exampleExplanation: problemData.example_test_case.explanation,
+          }),
+        };
+        
+        console.log("🚀 Starting call with problem metadata:", problemMetadata.problemTitle);
+        
+        await startCall(problemMetadata);
       } catch (err) {
         console.error("Failed to start interview call:", err);
         callInitializedRef.current = false;
